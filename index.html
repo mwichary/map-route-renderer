@@ -1,0 +1,367 @@
+<!--
+  Map route renderer.
+
+  This will take a set of geojson routes and animate them progressively into an MP4 video.
+
+  “Documentation”: https://twitter.com/mwichary/status/1427007100845060096
+
+  Necessary libraries:
+  - d3.v7.js: Download from https://d3js.org/
+  - FileSaver.js: Download from https://github.com/eligrey/FileSaver.js/
+  - ffmpeg-worker-mp4.js: Download from https://gist.github.com/ilblog/5fa2914e0ad666bbb85745dbf4b3f106
+    (note: there are many other ffmpeg JS worker wrappers and they might work as well)
+  
+  Necessary files:
+  - data/1.geojson, data/2.geojson, etc. for the routes (converted from GPX using “togeojson” tool)
+  - map.jpg: Background image with the map, prepare however you see fit
+
+  You might have to run this via a server rather than opening it as a file in the browser.
+  As hilarious as it sounds, running “php -S localhost:4444” (on a Mac) in a given directory
+  works best for me.
+
+  --
+
+  Copyright © 2021 Marcin Wichary
+
+  Permission is hereby granted, free of charge, to any person obtaining a copy
+  of this software and associated documentation files (the "Software"), to deal
+  in the Software without restriction, including without limitation the rights
+  to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+  copies of the Software, and to permit persons to whom the Software is
+  furnished to do so, subject to the following conditions:
+
+  The above copyright notice and this permission notice shall be included in all
+  copies or substantial portions of the Software.
+
+  THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+  IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+  FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+  AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+  LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+  OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+  SOFTWARE.
+-->
+
+<title>Map video renderer</title>
+<meta charset='utf-8'>
+
+<script src='d3.v7.js'></script>
+<script src='FileSaver.js'></script>
+
+<style>
+  #content {
+    outline: 1px solid black;
+    width: 800px;
+    height: 800px;
+    position: relative;
+  }
+  #content canvas {
+    width: 800px;
+    height: 800px;
+  }
+</style>
+
+<body>
+  <div id="content">
+    <canvas width="1600" height="1600"></canvas>
+  </div>
+
+<script>
+
+  // CONSTANTS FOR YOU TO PLAY WITH
+  // ------------------------------------------------------------
+
+  // Frames per second 
+  const FRAMERATE = 60 
+  // How many routes to draw
+  const ROUTE_COUNT = 20
+
+  // Which frames to render. Rendering all the frames of the video will likely exhaust
+  // the memory. Here you can render just a bit and then splice all the MP4s together
+  // at the end using ffmpeg
+  const FIRST_FRAME_TO_RENDER = 100
+  const LAST_FRAME_TO_RENDER = 150
+
+
+  // HELPER FUNCTIONS
+  // ------------------------------------------------------------
+
+  // Background map image
+  let bkImage
+  // Loaded geodata
+  let geodataToBeLoadedCount = 0
+  let geodata = []
+  // Saved pixel data
+  let imagePixelData = []
+
+
+  // HELPER FUNCTIONS
+  // ------------------------------------------------------------
+
+  function convertDataURIToBinary(dataURI) {
+    var base64 = dataURI.replace(/^data[^,]+,/, '')
+    var raw = window.atob(base64)
+    var rawLength = raw.length
+
+    var array = new Uint8Array(new ArrayBuffer(rawLength))
+    for (i = 0; i < rawLength; i++) {
+        array[i] = raw.charCodeAt(i)
+    }
+
+    return array
+  }
+
+
+  // MAIN FUNCTIONS
+  // ------------------------------------------------------------
+
+  function main() {
+    console.warn('Starting…')
+    console.warn('Step 1: Loading background image…')
+
+    bkImage = new Image()
+    bkImage.onload = loadGeojsonData
+    bkImage.src = 'map.jpg'
+  }
+
+  function onGeodataLoaded(routeNo, req) {
+    if (req.readyState != 4) {
+      return
+    }
+
+    const data = JSON.parse(req.response)
+
+    // This reduces the complexity of a route 15-fold so it’s faster to draw
+    const skip = 15
+    let newData = []
+    for (var i = 0; i < Math.floor(data.features[0].geometry.coordinates.length / skip); i++) {
+      newData.push(data.features[0].geometry.coordinates[i * skip])
+    }
+
+    geodata[routeNo] = data
+    geodata[routeNo].features[0].geometry.coordinates = newData
+
+    geodataToBeLoadedCount--
+    if (geodataToBeLoadedCount == 0) {
+      renderFrames()
+    }
+  }
+
+  function loadGeojsonData() {
+    console.warn('Step 2: Loading geojson data…')
+
+    for (let i = 1; i <= ROUTE_COUNT; i++) { 
+      geodataToBeLoadedCount++
+
+      let req = new XMLHttpRequest()
+      req.addEventListener('load', () => { onGeodataLoaded(i, req) } )
+      req.open('GET', `data/${i}.geojson`)
+      req.send()
+    }
+  }
+
+  // Percentage is expressed from 0.0 (start drawing a route)
+  // to 1.0 (the entire route is drawn in a resting state)
+  function drawRoute(context, geoGenerator, routeNo, percentage) {   
+    if (percentage < 0) {
+      return
+    }
+
+    let routeLength = geodata[routeNo].features[0].geometry.coordinates.length
+
+    // Draw the route in 10 chunks. 
+    // Chunk 9 is the “head”, the thick pulse that leads the route
+    // Chunk 0 is the tail, the thing that is left behind as the route finished running.
+    for (var chunk = 0; chunk <= 9; chunk++) {
+
+      // This is the length of each chunk. Change this to vary the intensity of the “pulse.”
+      // Note that the last (tail) chunk will be longer and always and at the beginning of 
+      // a route
+      let chunkLength = routeLength * .01
+      
+      // This calculates where each chunk lies on the entire path
+      let offset = percentage * (routeLength + chunkLength * 11) - chunkLength * 10
+
+      // This calculates the beginning and end of each chunk
+      let start = Math.floor(chunkLength * (chunk - 1) + offset - 1) // minus one guarantees overlap
+      let end = Math.floor(chunkLength * chunk + offset)
+
+      // Always extend the tail to the beginning of a route
+      if ((chunk == 0) && (start > 0)) {
+        start = 0
+      }
+
+      if (start < 0) {
+        start = 0
+      }
+      
+      // Don’t continue if there is nothing to draw
+      if (end <= 0) {
+        continue
+      }
+
+      // Vary opacity so it starts with 100% for the pulse and ends with 50% for resting state
+      context.globalAlpha = .5 + (chunk / 9) * .5
+
+      // Vary line width so it starts with 8 for the pulse and ends with 1 for resting state
+      context.lineWidth = 1 + (chunk / 9) * 7
+
+      // Draw the chunk
+      context.beginPath()
+      let data = JSON.parse(JSON.stringify(geodata[routeNo])) // duplicate geodata and only pick the necessary bits
+      data.features[0].geometry.coordinates = data.features[0].geometry.coordinates.slice(start, end)
+      geoGenerator({type: 'FeatureCollection', features: data.features})
+      context.stroke()
+    }
+  }
+
+  function renderFrames() {
+    console.warn('Step 3: Rendering frames…')
+
+    // Prepares D3 and drawing
+    // ------------------------------------------------
+
+    let context = d3.select('#content canvas')
+      .node()
+      .getContext('2d');
+
+    let projection = d3.geoMercator()
+      .center([-122.4425153, 37.7545106]) // Middle of San Francisco
+      .translate([800, 800]) // Matches the canvas width
+      .scale([600000])
+
+    let geoGenerator = d3.geoPath()
+      .projection(projection)
+      .context(context)
+
+    context.strokeStyle = 'black'
+    context.lineJoin = 'round'
+
+    // Figure out with routes to draw. This is useful for testing, where you can just do
+    // const routes = [1, 2] instead.
+    // ------------------------------------------------
+
+    let routes = []
+    for (var i = 1; i <= ROUTE_COUNT; i++) { routes.push(i) }
+
+    // Precalculate all the timing data: when to draw each route and for
+    // how long.
+    // Note that progressively with each route the route duration gets shorter,
+    // and there is more and more overlap between routes drawn.
+    // ------------------------------------------------
+
+    let routeTimingData = []
+
+    // Starting duration of route drawing in finished video (in secs)
+    let routeDuration = 2.0
+    // Pause between routes. Note that this will go negative, which means
+    // routes will start overlapping towards the end of the video
+    let routePause = 0.0
+
+    for (var i = 0; i < routes.length; i++) {
+      if (i == 0) {
+        startInSecs = 0
+      } else {
+        startInSecs = routeTimingData[i - 1].endInSecs + routePause
+      }
+
+      routeTimingData[i] = {
+        startInSecs: startInSecs,
+        endInSecs: startInSecs + routeDuration,
+      }
+
+      // Decrease the duration by a little, but won’t allow it to get smaller by 400ms
+      routeDuration -= .03
+      if (routeDuration < .4) {
+        routeDuration = .4
+      }
+      
+      // Decrease the overlap by a little, but won’t allow it to get tighter than 100ms
+      routePause -= .01
+      if (routePause < -.1) {
+        routePause = -.1
+      }
+    }
+
+    const globalEndInSecs = routeTimingData[routeTimingData.length - 1].endInSecs
+
+    // Outputs total time of video in seconds, and in frames
+    console.warn(`Total time: ${globalEndInSecs} secs + ${Math.ceil(FRAMERATE * globalEndInSecs)} frames`)
+
+    // Render all the frames
+    // ------------------------------------------------
+    let frameNo = 0
+    for (var frame = FIRST_FRAME_TO_RENDER; frame <= LAST_FRAME_TO_RENDER; frame++) {
+      console.log(`…rendering frame ${frame} (out of ${FIRST_FRAME_TO_RENDER}-${LAST_FRAME_TO_RENDER})`)
+
+      // Clear the canvas by drawing the background image that contains a map 
+      context.globalAlpha = 1.0
+      context.drawImage(bkImage, 0, 0, 1600, 1600)
+
+      // Draw all the necessary routes in the frame
+      for (var i in routeTimingData) {
+        const datum = routeTimingData[i]
+
+        const startInFrames = datum.startInSecs * FRAMERATE
+        if (frame >= startInFrames) {
+          drawRoute(context, geoGenerator, routes[i], (frame - startInFrames) / ((datum.endInSecs - datum.startInSecs) * FRAMERATE))
+        }
+      }
+
+      // Save all the pixels
+      const imgString = document.querySelector('canvas').toDataURL('image/jpeg', 1.0)
+      imagePixelData.push({
+        name: `img${(frameNo.toString()).padStart(5, '0')}.jpeg`,
+        data: convertDataURIToBinary(imgString)
+      })
+
+      frameNo++
+    }
+
+    compileVideo()
+  }
+
+  function compileVideo() {
+    console.warn('Step 4: Compiling into video…')
+
+    let worker = new Worker('/ffmpeg-worker-mp4.js')
+
+    worker.onmessage = function(e) {
+      var msg = e.data
+      
+      switch (msg.type) {
+        case 'stdout':
+        case 'stderr':
+          console.log(msg.data)
+          break
+        case 'exit':
+          console.warn(`Process exited with code ${msg.data}.`)
+          break
+        case 'done':
+          saveVideo(new Blob([msg.data.MEMFS[0].data], { type: 'video/mp4' }))
+          break
+      }
+    }
+
+    worker.postMessage({
+      type: 'run',
+      TOTAL_MEMORY: 2068435456,
+      arguments: `-r ${FRAMERATE} -i img%05d.jpeg -vf scale=1600:1600 -pix_fmt yuv420p -vb 30M out.mp4`.split(/ /),
+      
+      // ["-r", FRAMERATE.toString(), "-i", "img%05d.jpeg", "-vf", "scale=1600:1600", "-pix_fmt", "yuv420p", "-vb", "30M", "out.mp4"],
+      MEMFS: imagePixelData
+    })
+  }
+
+  function saveVideo(output) {
+    console.warn('Step 5: Saving…')
+
+    const url = webkitURL.createObjectURL(output)
+    saveAs(url, `${FIRST_FRAME_TO_RENDER}-${LAST_FRAME_TO_RENDER}.mp4`)
+
+    console.warn('All done!')
+  }
+
+  main()
+
+</script>

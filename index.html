@@ -347,8 +347,6 @@
       type: 'run',
       TOTAL_MEMORY: 2068435456,
       arguments: `-r ${FRAMERATE} -i img%05d.jpeg -vf scale=1600:1600 -pix_fmt yuv420p -vb 30M out.mp4`.split(/ /),
-      
-      // ["-r", FRAMERATE.toString(), "-i", "img%05d.jpeg", "-vf", "scale=1600:1600", "-pix_fmt", "yuv420p", "-vb", "30M", "out.mp4"],
       MEMFS: imagePixelData
     })
   }
